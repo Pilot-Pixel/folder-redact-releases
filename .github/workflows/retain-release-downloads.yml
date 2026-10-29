@@ -56,6 +56,11 @@ jobs:
               if len(published) < 2:
                   raise RuntimeError('Need two published numbered versions; deleting nothing')
               keep = published[:2]
+              # The app updater selects the highest stable version, skipping prereleases.
+              stable = next((r for r in published if not r['prerelease']), None)
+              if stable is not None and stable['tag_name'] not in {r['tag_name'] for r in keep}:
+                  raise RuntimeError('The active stable version is outside the two newest builds; '
+                                     'promote the intended release before pruning; deleting nothing')
               for release in keep:
                   version = release['tag_name'][1:]
                   required = {f'MaxRedact-{version}-Setup.exe', f'MaxRedact-{version}-win-x64.zip',

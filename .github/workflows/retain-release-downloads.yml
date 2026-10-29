@@ -1,0 +1,105 @@
+name: Retain current and previous release downloads
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: '47 12 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview deletions without removing files
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-download-retention
+  cancel-in-progress: false
+
+jobs:
+  retain-downloads:
+    if: github.repository == 'Pilot-Pixel/folder-redact-releases'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+    steps:
+      - name: Keep two published versions and preserve release history
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+
+          REPO = 'Pilot-Pixel/folder-redact-releases'
+          VERSION = re.compile(r'^v(\d+)\.(\d+)\.(\d+)$')
+
+          def gh(*args):
+              result = subprocess.run(['gh', 'api', *args], check=True,
+                                      capture_output=True, text=True, timeout=60)
+              return json.loads(result.stdout) if result.stdout.strip() else None
+
+          def releases():
+              return [release for page in gh('--paginate', '--slurp',
+                      f'repos/{REPO}/releases?per_page=100') for release in page]
+
+          def protected(rows):
+              published = [r for r in rows if not r['draft'] and VERSION.fullmatch(r['tag_name'])]
+              published.sort(key=lambda r: tuple(map(int, VERSION.fullmatch(r['tag_name']).groups())),
+                             reverse=True)
+              if len(published) < 2:
+                  raise RuntimeError('Need two published numbered versions; deleting nothing')
+              keep = published[:2]
+              for release in keep:
+                  version = release['tag_name'][1:]
+                  required = {f'MaxRedact-{version}-Setup.exe', f'MaxRedact-{version}-win-x64.zip',
+                              f'MaxRedact-{version}-win-arm64.zip', f'MaxRedact-{version}.dmg',
+                              'PilotAndPixel.png', 'SHA256SUMS.txt'}
+                  uploaded = {a['name'] for a in release['assets']
+                              if a['state'] == 'uploaded' and a['size'] > 0}
+                  if not required <= uploaded:
+                      raise RuntimeError(f"Incomplete downloads for {release['tag_name']}; deleting nothing")
+              return {r['tag_name'] for r in keep}
+
+          def main():
+              rows = releases()
+              keep = protected(rows)
+              # Drafts may still be receiving uploads; never prune them automatically.
+              candidates = [r for r in rows if not r['draft'] and r['tag_name'] not in keep]
+              if any(r.get('immutable') and r['assets'] for r in candidates):
+                  raise RuntimeError('Immutable old release requires manual review; deleting nothing')
+              dry_run = os.environ.get('DRY_RUN', 'true').lower() == 'true'
+              print(f'Keeping downloads: {sorted(keep)}; dry_run={dry_run}', flush=True)
+              removed = 0
+              for release in candidates:
+                  if not release['assets']:
+                      continue
+                  # Recheck before each release so a concurrent publication stops cleanup.
+                  if protected(releases()) != keep:
+                      raise RuntimeError('Published versions changed; stopping cleanup')
+                  for asset in release['assets']:
+                      current = gh(f"repos/{REPO}/releases/assets/{asset['id']}")
+                      if current['name'] != asset['name']:
+                          raise RuntimeError('Asset identity changed; stopping cleanup')
+                      print(f"{'Would remove' if dry_run else 'Removing'} {release['tag_name']}/{asset['name']}",
+                            flush=True)
+                      if not dry_run:
+                          gh('--method', 'DELETE', f"repos/{REPO}/releases/assets/{asset['id']}")
+                      removed += 1
+              after = releases()
+              if protected(after) != keep:
+                  raise RuntimeError('Protected versions changed during cleanup')
+              if not dry_run and any(r['assets'] for r in after
+                                     if not r['draft'] and r['tag_name'] not in keep):
+                  raise RuntimeError('Older published downloads remain; inspect this run')
+              print(f'Processed {removed} download files. Release records, notes and tags were preserved.')
+
+          if __name__ == '__main__':
+              main()
+          PY
